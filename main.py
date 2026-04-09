@@ -1,11 +1,13 @@
 import math
+import random
 import pygame
 from pygame.locals import *
 from game import Game
-from pathfinder import find_path, is_passable
+from pathfinder import find_path, is_passable, can_see
 from building import BUILDING_CONFIGS
 
 FPS        = 60
+GAME_SPEED = 2.0   # game time runs this many times faster than real time
 GRID_SIZE  = 200
 BASE_TW    = 48    # tile diamond width  at zoom=1 (px)
 BASE_TH    = 24    # tile diamond height at zoom=1 (px)
@@ -224,8 +226,13 @@ HUD_H = 52   # height of the top bar in pixels
 
 _POP_CAP_PER_BUILDING = {'Town Center': 5, 'Castle': 20, 'House': 5}
 
+_ANIMAL_TYPES = {'sheep', 'deer', 'boar'}
+
 def compute_pop_cap(buildings):
     return sum(_POP_CAP_PER_BUILDING.get(b.name, 0) for b in buildings)
+
+def compute_pop(units):
+    return sum(1 for u in units if u.unit_type not in _ANIMAL_TYPES)
 
 _RES_ORDER  = ['food', 'wood', 'gold', 'stone']
 _RES_COLORS = {
@@ -259,7 +266,7 @@ def draw_hud(surface, player, buildings, units, elapsed_secs, hud_font, bold_fon
         x += 20 + txt.get_width() + 24
 
     # ── Centre: name placeholder + population ─────────────────────────── #
-    pop     = len(units)
+    pop     = compute_pop(units)
     cap     = compute_pop_cap(buildings)
     pop_col = (255, 120, 80) if pop >= cap else (200, 200, 200)
     centre_txt = bold_font.render("—  —", True, (160, 160, 180))
@@ -290,38 +297,102 @@ _HOTKEY_LABEL = {v: k_name for k_name, (k, v) in {
     'Z':(K_z,(0,2)),'X':(K_x,(1,2)),'C':(K_c,(2,2)),'V':(K_v,(3,2)),'B':(K_b,(4,2)),
 }.items()}
 
+from player import AGES, TEAMS  # age ordering, team data
+
+def _is_unlocked(action, player, game):
+    """Return True if the action is available to the player right now.
+
+    Checks (in order):
+      1. min_age           – player must be at least this age
+      2. max_age           – player must not have exceeded this age
+      3. requires_bld      – list of building names; at least one of each must
+                             exist (completed) among game.buildings
+      4. requires_bld_count– minimum number of non-TC completed buildings
+    """
+    age_idx = AGES.index(player.age)
+    min_age = action.get('min_age', 'dark')
+    if age_idx < AGES.index(min_age):
+        return False
+
+    max_age = action.get('max_age')
+    if max_age and age_idx > AGES.index(max_age):
+        return False
+
+    for bld_name in action.get('requires_bld', []):
+        if not any(b.name == bld_name and not b.under_construction
+                   for b in game.buildings):
+            return False
+
+    min_count = action.get('requires_bld_count', 0)
+    if min_count > 0:
+        count = sum(1 for b in game.buildings
+                    if b.name != 'Town Center' and not b.under_construction)
+        if count < min_count:
+            return False
+
+    return True
+
+
+def _filter_actions(action_list, player, game=None):
+    """Return only unlocked actions."""
+    if game is None:
+        # fallback: age-only filter (used in contexts without game ref)
+        return [a for a in action_list
+                if AGES.index(player.age) >= AGES.index(a.get('min_age', 'dark'))]
+    return [a for a in action_list if _is_unlocked(a, player, game)]
+
+
 _BUILDING_ACTIONS = {
     'Town Center': [
-        {'pos': (0, 0), 'label': 'V', 'action': 'train_villager'},
+        {'pos': (0, 0), 'label': 'V',  'action': 'train_villager',  'min_age': 'dark'},
+        {'pos': (0, 1), 'label': 'F↑', 'action': 'age_up:feudal',   'min_age': 'dark',   'max_age': 'dark',
+         'requires_bld_count': 2, 'bg': (30, 60, 100)},
+        {'pos': (0, 1), 'label': 'C↑', 'action': 'age_up:castle',   'min_age': 'feudal', 'max_age': 'feudal',
+         'bg': (30, 60, 100)},
+        {'pos': (0, 1), 'label': 'I↑', 'action': 'age_up:imperial', 'min_age': 'castle', 'max_age': 'castle',
+         'bg': (30, 60, 100)},
     ],
     'Barracks': [
-        {'pos': (0, 0), 'label': 'Mi', 'action': 'train_militia'},
+        {'pos': (0, 0), 'label': 'Mi', 'action': 'train_militia',  'min_age': 'dark'},
+    ],
+    'Archery Range': [
+        {'pos': (0, 0), 'label': 'Ar', 'action': 'train_archer',   'min_age': 'feudal'},
+    ],
+    'Stable': [
+        {'pos': (0, 0), 'label': 'Sc', 'action': 'train_scout',    'min_age': 'feudal'},
     ],
 }
 
 _UNIT_ACTIONS = {
     'villager': [
-        {'pos': (0, 0), 'label': 'R', 'action': 'build_resource'},
-        {'pos': (1, 0), 'label': 'M', 'action': 'build_military'},
+        {'pos': (0, 0), 'label': 'R', 'action': 'build_resource', 'min_age': 'dark'},
+        {'pos': (1, 0), 'label': 'M', 'action': 'build_military', 'min_age': 'dark'},
     ],
 }
 
+_BACK_BTN = {'pos': (4, 2), 'label': '<', 'action': 'back',
+             'bg': (40, 40, 55), 'min_age': 'dark'}
+
 _UNIT_SUBMENUS = {
-    # Q=House, W=Mill, E=Mine, R=Lumber Camp
     'build_resource': [
-        {'pos': (0, 0), 'label': 'H',  'action': 'place_House'},
-        {'pos': (1, 0), 'label': 'M',  'action': 'place_Mill',
-         'bg': (120, 80, 30)},
-        {'pos': (2, 0), 'label': 'MC', 'action': 'place_Mine',
-         'bg': (120, 80, 30)},
-        {'pos': (3, 0), 'label': 'LC', 'action': 'place_Lumber Camp',
-         'bg': (120, 80, 30)},
+        {'pos': (0, 0), 'label': 'H',  'action': 'place_House',        'min_age': 'dark'},
+        {'pos': (1, 0), 'label': 'Ml', 'action': 'place_Mill',         'min_age': 'dark',   'bg': (120, 80, 30)},
+        {'pos': (2, 0), 'label': 'Mi', 'action': 'place_Mine',         'min_age': 'dark',   'bg': (120, 80, 30)},
+        {'pos': (3, 0), 'label': 'LC', 'action': 'place_Lumber Camp',  'min_age': 'dark',   'bg': (120, 80, 30)},
+        {'pos': (4, 0), 'label': 'Fa', 'action': 'place_Farm',         'min_age': 'dark',   'bg': (100, 90, 20),
+         'requires_bld': ['Mill']},
+        _BACK_BTN,
     ],
     'build_military': [
-        {'pos': (0, 0), 'label': 'B', 'action': 'place_Barracks',
-         'bg': (100, 40, 40)},
+        {'pos': (0, 0), 'label': 'B',  'action': 'place_Barracks',     'min_age': 'dark',   'bg': (100, 40, 40)},
+        {'pos': (1, 0), 'label': 'AR', 'action': 'place_Archery Range','min_age': 'feudal', 'bg': (100, 70, 30)},
+        {'pos': (2, 0), 'label': 'St', 'action': 'place_Stable',       'min_age': 'feudal', 'bg': (80, 55, 20)},
+        _BACK_BTN,
     ],
 }
+
+# Buildings that trigger instant resource deposit when a villager is assigned to build them
+_RESOURCE_BUILDINGS = {'Mill', 'Mine', 'Lumber Camp', 'Farm'}
 
 # Resource types each building auto-sends builders to gather after completion
 _BUILDING_AUTO_GATHER = {
@@ -332,36 +403,62 @@ _BUILDING_AUTO_GATHER = {
 
 
 def _find_spawn_tile(game, b):
-    """Find first empty tile adjacent to building b."""
+    """Find empty tile adjacent to building b, preferring the side nearest the rally point."""
+    candidates = []
     for dx in range(b.width):
-        for pos in [(b.tile_x + dx, b.tile_z - 1),
-                    (b.tile_x + dx, b.tile_z + b.depth)]:
-            if game.is_tile_empty(*pos):
-                return pos
+        candidates.append((b.tile_x + dx, b.tile_z - 1))
+        candidates.append((b.tile_x + dx, b.tile_z + b.depth))
     for dz in range(b.depth):
-        for pos in [(b.tile_x - 1,       b.tile_z + dz),
-                    (b.tile_x + b.width, b.tile_z + dz)]:
-            if game.is_tile_empty(*pos):
-                return pos
-    return None
+        candidates.append((b.tile_x - 1,       b.tile_z + dz))
+        candidates.append((b.tile_x + b.width,  b.tile_z + dz))
+
+    empty = [pos for pos in candidates if game.is_tile_empty(*pos)]
+    if not empty:
+        return None
+
+    if b.rally_x is not None:
+        empty.sort(key=lambda p: math.hypot(p[0] - b.rally_x, p[1] - b.rally_z))
+
+    return empty[0]
 
 
-def update_production(game):
+def update_production(game, player):
+    pop_cap = compute_pop_cap(game.buildings)
+    pop     = compute_pop(game.units)
     for b in game.buildings:
-        if not b.queue:
+        if b.under_construction or not b.queue:
             b.queue_ticks = 0
             continue
+        cur = b.queue[0]
+        # Pause unit training (but not age-ups) when at pop cap
+        if not cur.startswith('age_up:') and pop >= pop_cap:
+            continue
+        # Determine ticks needed for the current queue head
+        cur_total = AGE_UP_DATA[cur]['ticks'] if cur.startswith('age_up:') else TRAIN_TICKS
         b.queue_ticks += 1
-        if b.queue_ticks >= TRAIN_TICKS:
-            unit_type = b.queue.pop(0)
+        if b.queue_ticks >= cur_total:
+            item = b.queue.pop(0)
             b.queue_ticks = 0
+            if item.startswith('age_up:'):
+                player.age = AGE_UP_DATA[item]['target']
+                continue
+            unit_type = item
             spawn = _find_spawn_tile(game, b)
             if spawn:
-                unit = game.add_unit(unit_type, spawn[0], spawn[1])
+                unit = game.add_unit(unit_type, spawn[0], spawn[1], team=b.team)
                 if b.rally_x is not None:
                     rally_tile = game.get_tile(b.rally_x, b.rally_z)
                     if rally_tile and rally_tile['type'] == 'resource':
                         gather_resource(game, [unit], rally_tile['obj'])
+                    elif rally_tile and rally_tile['type'] == 'building':
+                        rally_bld = rally_tile['obj']
+                        if rally_bld.under_construction and unit.carry_cap > 0:
+                            _assign_builder(unit, rally_bld, game)
+                        else:
+                            path = find_path(game, spawn[0], spawn[1],
+                                             b.rally_x, b.rally_z)
+                            if path:
+                                unit.set_path(path)
                     else:
                         path = find_path(game, spawn[0], spawn[1],
                                          b.rally_x, b.rally_z)
@@ -424,6 +521,7 @@ def gather_resource(game, units, res):
     for unit in units:
         if unit.carry_cap == 0:
             continue
+        unit.role = res.res_type   # persist gathering role
         unit.build_target = None
         unit.action_queue = []
         adj = _gather_adj_tile(game, res)
@@ -437,10 +535,188 @@ def gather_resource(game, units, res):
             unit.state = 'gathering'   # already adjacent
 
 
+def slaughter_sheep(game, player, villagers, sheep):
+    """Send villagers to slaughter a sheep. When close, sheep dies and becomes food."""
+    for unit in villagers:
+        unit.role          = 'shepherd'
+        unit.build_target  = None
+        unit.action_queue  = []
+        unit.gather_target = sheep        # sheep Unit acts as target
+        unit.gather_timer  = 0
+        path = find_path(game, unit.x, unit.z, round(sheep.x), round(sheep.z))
+        if path:
+            unit.state = 'slaughter_move'
+            unit.set_path(path)
+        else:
+            unit.state = 'slaughtering'
+
+
+def _convert_sheep_to_food(game, player, sheep):
+    """Remove sheep unit, place two food ResourceTiles at its location."""
+    from resource import ResourceTile
+    if sheep in game.units:
+        game.units.remove(sheep)
+    tx, tz = round(sheep.x), round(sheep.z)
+
+    candidates = [(tx, tz), (tx+1, tz), (tx-1, tz), (tx, tz+1), (tx, tz-1),
+                  (tx+1, tz+1), (tx-1, tz+1), (tx+1, tz-1), (tx-1, tz-1)]
+    placed = []
+    half = max(1, sheep.food_value // 2)
+    for pos in candidates:
+        if not game.tiles.get(pos):
+            tile = ResourceTile('berries', pos[0], pos[1], half, (0.85, 0.85, 0.80))
+            game.resources.append(tile)
+            game.tiles[pos] = {'type': 'resource', 'obj': tile}
+            placed.append(tile)
+            if len(placed) == 2:
+                break
+
+    return placed[0] if placed else None
+
+
+def start_hunt(game, villagers, animal):
+    """Send villagers to hunt an animal (boar/deer) using ranged attack."""
+    for unit in villagers:
+        unit.build_target  = None
+        unit.action_queue  = []
+        unit.hunt_target   = animal
+        unit.attack_timer  = 0
+        path = find_path(game, unit.x, unit.z, round(animal.x), round(animal.z))
+        unit.state = 'hunt_move'
+        if path:
+            unit.set_path(path)
+
+
+def _animal_to_food(game, animal):
+    """Remove a dead animal and place a food ResourceTile at its position."""
+    from resource import ResourceTile
+    if animal in game.units:
+        game.units.remove(animal)
+    tx, tz = round(animal.x), round(animal.z)
+    for ddx, ddz in [(0,0),(1,0),(-1,0),(0,1),(0,-1),(1,1),(-1,-1)]:
+        if not game.tiles.get((tx + ddx, tz + ddz)):
+            tile = ResourceTile('berries', tx + ddx, tz + ddz,
+                                animal.food_value, (0.88, 0.80, 0.55))
+            game.resources.append(tile)
+            game.tiles[(tx + ddx, tz + ddz)] = {'type': 'resource', 'obj': tile}
+            return tile
+    return None
+
+
+def update_hunt(game, player):
+    """Handle hunt_move/hunting states for villagers and boar/deer AI."""
+    dead = []
+
+    for unit in list(game.units):
+        # ── Villager hunting ─────────────────────────────────────────── #
+        if unit.state in ('hunt_move', 'hunting'):
+            target = unit.hunt_target
+            if target is None or target not in game.units:
+                unit.hunt_target = None
+                unit.state = 'idle'
+                continue
+            dist = math.hypot(unit.x - target.x, unit.z - target.z)
+            if unit.state == 'hunt_move':
+                if dist <= unit.hunt_range:
+                    unit.state = 'hunting'
+                    unit.set_path([])
+                    unit.attack_timer = 0
+                elif not unit.path:
+                    path = find_path(game, unit.x, unit.z,
+                                     round(target.x), round(target.z))
+                    if path:
+                        unit.set_path(path)
+            else:  # hunting
+                if dist > unit.hunt_range + 1.5:
+                    unit.state = 'hunt_move'
+                    continue
+                unit.attack_timer += 1
+                if unit.attack_timer >= unit.attack_ticks:
+                    unit.attack_timer = 0
+                    dmg = max(0, unit.attack - target.pierce_armor)
+                    target.hp -= dmg
+                    if target.hp <= 0 and target not in dead:
+                        dead.append(target)
+                        continue
+                    # Trigger animal reaction on first hit
+                    if target.aggro_target is None:
+                        target.aggro_target = unit
+                        if target.unit_type == 'boar':
+                            target.state = 'charging'
+                        elif target.unit_type == 'deer':
+                            target.state = 'fleeing'
+
+        # ── Boar AI ──────────────────────────────────────────────────── #
+        elif unit.unit_type == 'boar' and unit.state in ('charging', 'boar_attack'):
+            target = unit.aggro_target
+            if target is None or target not in game.units:
+                unit.aggro_target = None
+                unit.state = 'idle'
+                continue
+            dist = math.hypot(unit.x - target.x, unit.z - target.z)
+            if unit.state == 'charging':
+                if dist <= 1.2:
+                    unit.state = 'boar_attack'
+                    unit.attack_timer = 0
+                elif not unit.path:
+                    path = find_path(game, unit.x, unit.z,
+                                     round(target.x), round(target.z))
+                    if path:
+                        unit.set_path(path)
+            else:  # boar_attack
+                if dist > 1.8:
+                    unit.state = 'charging'
+                    continue
+                unit.attack_timer += 1
+                if unit.attack_timer >= unit.attack_ticks:
+                    unit.attack_timer = 0
+                    dmg = max(0, unit.attack - target.pierce_armor)
+                    target.hp -= dmg
+                    # Villager death (just idle them for now; full death TBD)
+                    if target.hp <= 0:
+                        target.hp = 0
+                        target.state = 'idle'
+
+        # ── Deer AI ──────────────────────────────────────────────────── #
+        elif unit.unit_type == 'deer' and unit.state == 'fleeing':
+            attacker = unit.aggro_target
+            if attacker is None or attacker not in game.units:
+                unit.aggro_target = None
+                unit.state = 'idle'
+                continue
+            if not unit.path:
+                dx = unit.x - attacker.x
+                dz = unit.z - attacker.z
+                d  = math.hypot(dx, dz) or 1.0
+                half = GRID_SIZE // 2
+                nx = round(unit.x + dx / d * 12)
+                nz = round(unit.z + dz / d * 12)
+                nx = max(-half + 2, min(half - 2, nx))
+                nz = max(-half + 2, min(half - 2, nz))
+                path = find_path(game, unit.x, unit.z, nx, nz)
+                if path:
+                    unit.set_path(path)
+                else:
+                    unit.aggro_target = None
+                    unit.state = 'idle'
+
+    # Convert dead animals to food and notify hunters
+    for animal in dead:
+        food_tile = _animal_to_food(game, animal)
+        for u in game.units:
+            if u.hunt_target is animal:
+                u.hunt_target = None
+                if food_tile:
+                    gather_resource(game, [u], food_tile)
+                else:
+                    _start_next_action(u, game, player)
+
+
 def update_gathering(game, player):
     for unit in game.units:
         if unit.carry_cap == 0 or unit.state not in (
-                'gather_move', 'gathering', 'return_move'):
+                'gather_move', 'gathering', 'return_move',
+                'slaughter_move', 'slaughtering'):
             continue
 
         if unit.state == 'gather_move':
@@ -490,6 +766,29 @@ def update_gathering(game, player):
                         unit.gather_target = None
                         _start_next_action(unit, game, player)
 
+        elif unit.state in ('slaughter_move', 'slaughtering'):
+            sheep = unit.gather_target
+            if sheep is None or sheep not in game.units:
+                unit.state = 'idle'
+                unit.gather_target = None
+                continue
+            if math.hypot(unit.x - sheep.x, unit.z - sheep.z) <= 1.5:
+                # Close enough — convert immediately
+                food_tile = _convert_sheep_to_food(game, player, sheep)
+                unit.gather_target = None
+                if food_tile:
+                    gather_resource(game, [unit], food_tile)
+                else:
+                    _start_next_action(unit, game, player)
+            elif not unit.path:
+                # Path to a tile adjacent to the sheep, not on top of it
+                adj = _gather_adj_tile(game, type('_', (), {
+                    'tile_x': round(sheep.x), 'tile_z': round(sheep.z)})())
+                path = find_path(game, unit.x, unit.z, adj[0], adj[1])
+                unit.state = 'slaughter_move'
+                if path:
+                    unit.set_path(path)
+
 
 def near_building(unit, b, margin=1.5):
     """True if unit is within margin tiles of the building footprint.
@@ -535,20 +834,46 @@ def action_at_screen(sx, sy):
 _TRAIN_ACTIONS = {
     'train_villager': 'villager',
     'train_militia':  'militia',
+    'train_archer':   'archer',
+    'train_scout':    'scout_cavalry',
+}
+
+# age_up:<target> → cost, duration (ticks), display label, target age key
+AGE_UP_DATA = {
+    'age_up:feudal':   {'cost': {'food': 500},              'ticks': 130*FPS, 'label': 'F↑', 'target': 'feudal'},
+    'age_up:castle':   {'cost': {'food': 800, 'gold': 200}, 'ticks': 160*FPS, 'label': 'C↑', 'target': 'castle'},
+    'age_up:imperial': {'cost': {'food': 1000,'gold': 800}, 'ticks': 190*FPS, 'label': 'I↑', 'target': 'imperial'},
 }
 
 
-def _fire_action(pos, selected_building, selected_unit, action_submenu, player):
+def _fire_action(pos, selected_building, selected_unit, action_submenu,
+                 player, game, placement_mode=None):
     """Execute the action at grid position pos.
     Returns a command tuple or None:
       ('set_submenu', name)  – open a submenu
       ('place', bld_name)    – enter placement mode
       None                   – action fired inline (or nothing to do)
     """
+    if placement_mode:
+        if pos == (4, 2):
+            return ('cancel_place', None)
+        return None
+
     if selected_building:
-        for a in _BUILDING_ACTIONS.get(selected_building.name, []):
+        for a in _filter_actions(_BUILDING_ACTIONS.get(selected_building.name, []), player, game):
             if a['pos'] == pos:
-                unit_type = _TRAIN_ACTIONS.get(a['action'])
+                act = a['action']
+                if act.startswith('age_up:'):
+                    data = AGE_UP_DATA[act]
+                    cost = data['cost']
+                    if any(q.startswith('age_up:') for q in selected_building.queue):
+                        return None  # already queued
+                    if all(player.resources.get(r, 0) >= amt for r, amt in cost.items()):
+                        for r, amt in cost.items():
+                            player.resources[r] -= amt
+                        selected_building.queue.append(act)
+                    return None
+                unit_type = _TRAIN_ACTIONS.get(act)
                 if unit_type:
                     from unit import UNIT_STATS
                     cost = UNIT_STATS[unit_type].get('cost', {})
@@ -561,18 +886,20 @@ def _fire_action(pos, selected_building, selected_unit, action_submenu, player):
         return None
 
     if selected_unit:
-        # Determine active action list
-        if action_submenu:
-            acts = _UNIT_SUBMENUS.get(action_submenu, [])
-        else:
-            acts = _UNIT_ACTIONS.get(selected_unit.unit_type, [])
-        for a in acts:
+        raw = (_UNIT_SUBMENUS.get(action_submenu, []) if action_submenu
+               else _UNIT_ACTIONS.get(selected_unit.unit_type, []))
+        for a in _filter_actions(raw, player, game):
             if a['pos'] == pos:
                 act = a['action']
                 if act in ('build_resource', 'build_military'):
                     return ('set_submenu', act)
+                if act == 'back':
+                    return ('back', None)
                 if act.startswith('place_'):
-                    return ('place', act[len('place_'):])
+                    bld_name = act[len('place_'):]
+                    if not can_afford(player, bld_name):
+                        return None   # silently do nothing
+                    return ('place', bld_name)
                 return None
     return None
 
@@ -616,6 +943,12 @@ def can_afford(player, bld_name):
                for res, amt in cost.items())
 
 
+_PRODUCTION_BUILDINGS = {
+    'Town Center', 'Barracks', 'Archery Range', 'Stable',
+    'Monastery', 'Castle', 'Siege Workshop',
+}
+
+
 def place_building(game, player, bld_name, tx, tz, builders):
     """Deduct cost, create building under construction, assign builders.
     Returns the new Building, or None if the player can't afford it.
@@ -628,9 +961,20 @@ def place_building(game, player, bld_name, tx, tz, builders):
     cfg   = BUILDING_CONFIGS[bld_name]
     b = game.add_building(bld_name, tx, tz,
                           cfg['size'], cfg['size'],
-                          cfg['color'], cfg['label'])
+                          cfg['color'], cfg['label'], team=player.team)
     b.under_construction = True
+    # Set default rally point one tile past the front edge, centered
+    if bld_name in _PRODUCTION_BUILDINGS:
+        b.rally_x = tx + cfg['size'] // 2
+        b.rally_z = tz + cfg['size'] + 1
+    is_resource_bld = bld_name in _RESOURCE_BUILDINGS
     for unit in builders:
+        if is_resource_bld and unit.carried > 0:
+            res_key = _DEPOSIT_AS.get(unit.carried_type, unit.carried_type)
+            if res_key:
+                player.resources[res_key] = player.resources.get(res_key, 0) + unit.carried
+            unit.carried = 0
+            unit.carried_type = None
         _assign_builder(unit, b, game)
     return b
 
@@ -640,7 +984,7 @@ def update_builders(game, player):
     for unit in game.units:
         if unit.state == 'build_move':
             if not unit.path and unit.build_target:
-                if near_building(unit, unit.build_target):
+                if near_building(unit, unit.build_target, margin=2.5):
                     unit.state = 'building'
         elif unit.state == 'building':
             if unit.build_target and not unit.build_target.under_construction:
@@ -658,8 +1002,29 @@ def _find_nearest_resource(game, unit, res_types):
     return best
 
 
+def _find_nearest_sheep(game, unit):
+    """Return the nearest sheep that belongs to this unit's team (or unconverted)."""
+    best, best_d = None, float('inf')
+    for u in game.units:
+        if u.unit_type == 'sheep' and (u.team is None or u.team == unit.team):
+            d = math.hypot(unit.x - u.x, unit.z - u.z)
+            if d < best_d:
+                best_d, best = d, u
+    return best
+
+
+# Maps gather role → resource types to search for
+_ROLE_RES_TYPES = {
+    'wood':    {'wood'},
+    'gold':    {'gold'},
+    'stone':   {'stone'},
+    'berries': {'berries'},
+}
+
+
 def update_construction(game, player):
     """Advance construction progress; log-scaled speed with multiple builders."""
+    farms_to_convert = []
     for b in game.buildings:
         if not b.under_construction:
             continue
@@ -671,6 +1036,9 @@ def update_construction(game, player):
         b.build_ticks_done += math.log2(n + 1)
         if b.build_ticks_done >= b.build_ticks_total:
             b.under_construction = False
+            if b.name == 'Farm':
+                farms_to_convert.append(b)
+                continue
             auto_res = _BUILDING_AUTO_GATHER.get(b.name)
             for u in game.units:
                 if u.build_target is b:
@@ -681,6 +1049,94 @@ def update_construction(game, player):
                             gather_resource(game, [u], res)
                             continue
                     _start_next_action(u, game, player)
+
+    # Convert completed farms into food resource tiles
+    from resource import ResourceTile
+    for b in farms_to_convert:
+        game.buildings.remove(b)
+        for dx in range(b.width):
+            for dz in range(b.depth):
+                game.tiles.pop((b.tile_x + dx, b.tile_z + dz), None)
+        farm_tile = ResourceTile('berries', b.tile_x, b.tile_z, 250,
+                                 (0.76, 0.66, 0.12))
+        game.resources.append(farm_tile)
+        game.tiles[(b.tile_x, b.tile_z)] = {'type': 'resource', 'obj': farm_tile}
+        for u in game.units:
+            if u.build_target is b:
+                u.build_target = None
+                gather_resource(game, [u], farm_tile)
+
+
+def _sheep_at_tile(game, tx, tz, radius=0.5):
+    """Return a sheep unit whose position is within radius of (tx, tz), or None."""
+    for u in game.units:
+        if u.unit_type == 'sheep' and math.hypot(u.x - tx, u.z - tz) <= radius:
+            return u
+    return None
+
+
+_HUNT_ANIMALS = {'boar', 'deer'}
+
+def _hunt_animal_at_tile(game, tx, tz, radius=1.2):
+    """Return a huntable animal (boar/deer) near (tx, tz), or None."""
+    for u in game.units:
+        if u.unit_type in _HUNT_ANIMALS and math.hypot(u.x - tx, u.z - tz) <= radius:
+            return u
+    return None
+
+
+_SHEEP_CONVERT_RADIUS = 3.0   # tiles — any friendly unit within this range claims a sheep
+_SHEEP_KILL_RADIUS    = 0.8   # tiles — unit must be this close to "kill" and collect food
+
+def any_friendly_can_see(game, player, tx, tz):
+    """True if any unit on the player's team has LOS to tile (tx, tz)."""
+    for unit in game.units:
+        if unit.team == player.team:
+            if can_see(game, unit.x, unit.z, tx, tz, unit.los_range):
+                return True
+    return False
+
+
+def update_sheep(game, player):
+    """Convert neutral sheep to player's team when a friendly unit has LOS.
+    Sheep with food_value that reach 0 hp drop food into the player's stockpile
+    and are removed.
+    """
+    dead = []
+    for unit in game.units:
+        if unit.unit_type != 'sheep':
+            continue
+
+        # Conversion: neutral sheep → team of the first friendly unit with LOS
+        if unit.team is None:
+            for other in game.units:
+                if other is unit or other.unit_type == 'sheep':
+                    continue
+                if can_see(game, other.x, other.z, unit.x, unit.z, other.los_range):
+                    unit.team = other.team
+                    break
+
+        # Death check: hp <= 0 → add food
+        if unit.hp <= 0:
+            if unit.food_value > 0:
+                # Award food to the team that owns (or converted) the sheep
+                player.resources['food'] = player.resources.get('food', 0) + unit.food_value
+            dead.append(unit)
+
+    for unit in dead:
+        game.units.remove(unit)
+
+
+def cleanup_resources(game):
+    """Remove depleted resource tiles from the map."""
+    depleted = [r for r in game.resources if r.amount <= 0]
+    for r in depleted:
+        game.resources.remove(r)
+        game.tiles.pop((r.tile_x, r.tile_z), None)
+        # Clear any unit gather_targets pointing to this tile
+        for u in game.units:
+            if u.gather_target is r:
+                u.gather_target = None
 
 
 def draw_placement_ghost(surface, bld_name, mx, my, game, player):
@@ -715,8 +1171,33 @@ def draw_placement_ghost(surface, bld_name, mx, my, game, player):
     surface.blit(ghost, (min_x, min_y))
 
 
+def _draw_team_badge(surface, obj, player, x, y, font):
+    """Draw a small color swatch + team name + relationship label."""
+    team_key = getattr(obj, 'team', None)
+    if team_key is None:
+        return
+    tdata = TEAMS.get(team_key, {})
+    tc = tdata.get('color', (128, 128, 128))
+    tname = tdata.get('display', team_key.capitalize())
+
+    if team_key == player.team:
+        rel = 'You'
+        rel_col = (100, 200, 100)
+    else:
+        rel = 'Enemy'
+        rel_col = (220, 80, 80)
+
+    # Color swatch
+    pygame.draw.rect(surface, tc, (x, y, 12, 12))
+    pygame.draw.rect(surface, (200, 200, 200), (x, y, 12, 12), 1)
+    # Team name
+    t = font.render(f"{tname} — {rel}", True, rel_col)
+    surface.blit(t, (x + 16, y))
+
+
 def draw_bot_hud(surface, selected_bld, selected_unit, sel_count,
-                 selected_res, action_submenu, hud_font, bold_font):
+                 selected_res, action_submenu, placement_mode,
+                 player, game, hud_font, bold_font):
     panel_y = screen_h - BOT_HUD_H
     sw = surface.get_width()
 
@@ -727,13 +1208,16 @@ def draw_bot_hud(surface, selected_bld, selected_unit, sel_count,
     pygame.draw.line(surface, (60, 60, 90), (0, panel_y), (sw, panel_y), 1)
 
     # ── Action grid (5×3) ─────────────────────────────────────────────── #
-    if selected_bld:
-        actions = _BUILDING_ACTIONS.get(selected_bld.name, [])
+    if placement_mode:
+        actions = [{'pos': (4, 2), 'label': 'X', 'action': 'cancel_place',
+                    'bg': (100, 30, 30), 'min_age': 'dark'}]
+    elif selected_bld:
+        actions = _filter_actions(
+            _BUILDING_ACTIONS.get(selected_bld.name, []), player, game)
     elif selected_unit:
-        if action_submenu:
-            actions = _UNIT_SUBMENUS.get(action_submenu, [])
-        else:
-            actions = _UNIT_ACTIONS.get(selected_unit.unit_type, [])
+        raw = (_UNIT_SUBMENUS.get(action_submenu, []) if action_submenu
+               else _UNIT_ACTIONS.get(selected_unit.unit_type, []))
+        actions = _filter_actions(raw, player, game)
     else:
         actions = []
     action_map = {a['pos']: a for a in actions}
@@ -772,19 +1256,26 @@ def draw_bot_hud(surface, selected_bld, selected_unit, sel_count,
     if selected_bld:
         name_txt = bold_font.render(selected_bld.name, True, (40, 30, 10))
         surface.blit(name_txt, (info_x + 8, info_y + 6))
+        _draw_team_badge(surface, selected_bld, player,
+                         info_x + 8, info_y + 20, hud_font)
 
         # Queue item icons
-        for i, unit_type in enumerate(selected_bld.queue):
+        for i, item in enumerate(selected_bld.queue):
             qr = pygame.Rect(info_x + 8 + i * 38, info_y + 30, 34, 34)
-            pygame.draw.rect(surface, (80, 60, 30), qr)
+            is_age = item.startswith('age_up:')
+            bg_col = (30, 55, 90) if is_age else (80, 60, 30)
+            pygame.draw.rect(surface, bg_col, qr)
             pygame.draw.rect(surface, (160, 130, 70), qr, 1)
-            ql = hud_font.render(unit_type[0].upper(), True, (220, 200, 140))
+            lbl_str = AGE_UP_DATA[item]['label'] if is_age else item[0].upper()
+            ql = hud_font.render(lbl_str, True, (180, 210, 255) if is_age else (220, 200, 140))
             surface.blit(ql, (qr.x + 17 - ql.get_width() // 2,
                               qr.y + 17 - ql.get_height() // 2))
 
-        # Training progress bar
+        # Training/research progress bar
         if selected_bld.queue:
-            prog = selected_bld.queue_ticks / TRAIN_TICKS
+            cur_item = selected_bld.queue[0]
+            cur_total = AGE_UP_DATA[cur_item]['ticks'] if cur_item.startswith('age_up:') else TRAIN_TICKS
+            prog = selected_bld.queue_ticks / cur_total
             bar = pygame.Rect(info_x + 8, info_y + info_h - 14, info_w - 16, 8)
             pygame.draw.rect(surface, (80, 65, 40), bar)
             pygame.draw.rect(surface, (180, 140, 60),
@@ -798,10 +1289,12 @@ def draw_bot_hud(surface, selected_bld, selected_unit, sel_count,
             header = selected_unit.unit_type.capitalize()
         name_txt = bold_font.render(header, True, (40, 30, 10))
         surface.blit(name_txt, (info_x + 8, info_y + 6))
+        _draw_team_badge(surface, selected_unit, player,
+                         info_x + 8, info_y + 20, hud_font)
         if sel_count == 1:
             # HP bar only meaningful for a single unit
             hp_w = min(info_w - 16, 160)
-            hp_rect = pygame.Rect(info_x + 8, info_y + 28, hp_w, 10)
+            hp_rect = pygame.Rect(info_x + 8, info_y + 38, hp_w, 10)
             pygame.draw.rect(surface, (80, 30, 30), hp_rect)
             fill = int(hp_w * selected_unit.hp / selected_unit.max_hp)
             pygame.draw.rect(surface, (60, 180, 60),
@@ -809,7 +1302,7 @@ def draw_bot_hud(surface, selected_bld, selected_unit, sel_count,
             pygame.draw.rect(surface, (100, 80, 50), hp_rect, 1)
             hp_lbl = hud_font.render(
                 f"{selected_unit.hp} / {selected_unit.max_hp}", True, (40, 30, 10))
-            surface.blit(hp_lbl, (info_x + 8, info_y + 44))
+            surface.blit(hp_lbl, (info_x + 8, info_y + 54))
 
     elif selected_res:
         name_txt = bold_font.render(selected_res.res_type.capitalize(),
@@ -857,8 +1350,19 @@ _SPREAD = [(0,0),(1,0),(-1,0),(0,1),(0,-1),(1,1),(-1,1),(1,-1),(-1,-1),
            (2,0),(-2,0),(0,2),(0,-2),(2,1),(2,-1),(-2,1),(-2,-1)]
 
 def _start_next_action(unit, game, player):
-    """Pop and execute the next action from unit.action_queue, or go idle."""
+    """Pop and execute the next action from unit.action_queue, or resume role."""
     if not unit.action_queue:
+        # Persist role: find the next target automatically
+        if unit.role == 'shepherd':
+            sheep = _find_nearest_sheep(game, unit)
+            if sheep:
+                slaughter_sheep(game, player, [unit], sheep)
+                return
+        elif unit.role in _ROLE_RES_TYPES:
+            res = _find_nearest_resource(game, unit, _ROLE_RES_TYPES[unit.role])
+            if res:
+                gather_resource(game, [unit], res)
+                return
         unit.state = 'idle'
         return
     action = unit.action_queue.pop(0)
@@ -874,7 +1378,26 @@ def _start_next_action(unit, game, player):
     elif atype == 'gather':
         gather_resource(game, [unit], action['target'])
     elif atype == 'build':
-        _assign_builder(unit, action['target'], game)
+        tgt = action['target']
+        if tgt.name in _RESOURCE_BUILDINGS and unit.carried > 0:
+            res_key = _DEPOSIT_AS.get(unit.carried_type, unit.carried_type)
+            if res_key:
+                player.resources[res_key] = player.resources.get(res_key, 0) + unit.carried
+            unit.carried = 0
+            unit.carried_type = None
+        _assign_builder(unit, tgt, game)
+    elif atype == 'slaughter':
+        sheep = action['target']
+        if sheep in game.units:
+            slaughter_sheep(game, player, [unit], sheep)
+        else:
+            _start_next_action(unit, game, player)
+    elif atype == 'hunt':
+        animal = action['target']
+        if animal in game.units:
+            start_hunt(game, [unit], animal)
+        else:
+            _start_next_action(unit, game, player)
 
 
 def update_movement(game, player):
@@ -919,11 +1442,41 @@ def main():
     game.add_player("Player 1", (0, 0, 255))
     game.start()
     game_start_ticks = pygame.time.get_ticks()
-    game.generate_base(GRID_SIZE)
+    player = game.players[0]
+    game.generate_base(GRID_SIZE, team=player.team)
 
     # Spawn 3 villagers just outside the TC
     for i in range(3):
-        game.add_unit('villager', -44 + i * 2, 52)
+        game.add_unit('villager', -44 + i * 2, 52, team=player.team)
+
+    # Spawn 1 scout cavalry at a random position 10-18 tiles from TC
+    _scout_angle = random.uniform(0, 2 * math.pi)
+    _scout_r     = random.uniform(10, 18)
+    game.add_unit('scout_cavalry',
+                  round(-52 + _scout_r * math.cos(_scout_angle)),
+                  round( 52 + _scout_r * math.sin(_scout_angle)),
+                  team=player.team)
+
+    # Spawn 4 neutral sheep near the TC
+    for i in range(4):
+        angle = i * math.pi / 2 + math.pi / 4
+        sx = round(-52 + 8 * math.cos(angle))
+        sz = round( 52 + 8 * math.sin(angle))
+        game.add_unit('sheep', sx, sz, team=None)
+
+    # Spawn deer and boars scattered further out (neutral hunt)
+    import random as _rnd2
+    _rnd2.seed()
+    for i in range(5):   # 5 deer
+        angle = _rnd2.uniform(0, 2 * math.pi)
+        r     = _rnd2.uniform(18, 35)
+        game.add_unit('deer', round(-52 + r * math.cos(angle)),
+                              round( 52 + r * math.sin(angle)), team=None)
+    for i in range(3):   # 3 boars
+        angle = _rnd2.uniform(0, 2 * math.pi)
+        r     = _rnd2.uniform(22, 40)
+        game.add_unit('boar', round(-52 + r * math.cos(angle)),
+                              round( 52 + r * math.sin(angle)), team=None)
 
     # Center the view on the TC
     tc_cx, tc_cz = -52.0, 52.0
@@ -957,12 +1510,16 @@ def main():
             if event.type == KEYDOWN and event.key in _HOTKEY_MAP:
                 pos = _HOTKEY_MAP[event.key]
                 cmd = _fire_action(pos, selected_building, selected_unit,
-                                   action_submenu)
+                                   action_submenu, player, game, placement_mode)
                 if cmd:
                     if cmd[0] == 'set_submenu':
                         action_submenu = cmd[1]
                     elif cmd[0] == 'place':
                         placement_mode = cmd[1]
+                    elif cmd[0] == 'back':
+                        action_submenu = None
+                    elif cmd[0] == 'cancel_place':
+                        placement_mode = None
             if event.type == MOUSEWHEEL:
                 set_zoom(zoom + event.y * 0.15)
 
@@ -1001,20 +1558,26 @@ def main():
                         act = action_at_screen(event.pos[0], event.pos[1])
                         if act:
                             cmd = _fire_action(act, selected_building,
-                                               selected_unit, action_submenu)
+                                               selected_unit, action_submenu,
+                                               player, game, placement_mode)
                             if cmd:
                                 if cmd[0] == 'set_submenu':
                                     action_submenu = cmd[1]
                                 elif cmd[0] == 'place':
                                     placement_mode = cmd[1]
+                                elif cmd[0] == 'back':
+                                    action_submenu = None
+                                elif cmd[0] == 'cancel_place':
+                                    placement_mode = None
                 else:
                     # Click on map — handle selection
                     for u in game.units:
                         u.selected = False
                     if is_dragging and drag_start:
-                        sel = units_in_box(game.units,
+                        sel = [u for u in units_in_box(game.units,
                                            drag_start[0], drag_start[1],
                                            drag_end[0],   drag_end[1])
+                               if u.team == player.team]
                         for u in sel:
                             u.selected = True
                         selected_building = None
@@ -1023,7 +1586,7 @@ def main():
                     else:
                         clicked = unit_at_screen(
                             game.units, event.pos[0], event.pos[1])
-                        if clicked:
+                        if clicked and clicked.team == player.team:
                             clicked.selected = True
                             selected_unit     = clicked
                             selected_building = None
@@ -1058,30 +1621,62 @@ def main():
                         selected_building.rally_x = tx
                         selected_building.rally_z = tz
                     else:
-                        sel = [u for u in game.units if u.selected]
+                        sel = [u for u in game.units if u.selected and u.team == player.team]
+                        shift = pygame.key.get_mods() & KMOD_SHIFT
                         if sel:
-                            tile = game.get_tile(tx, tz)
-                            if tile and tile['type'] == 'resource':
-                                gather_resource(game, sel, tile['obj'])
+                            tile   = game.get_tile(tx, tz)
+                            sheep  = _sheep_at_tile(game, tx, tz)
+                            animal = _hunt_animal_at_tile(game, tx, tz)
+                            vills  = [u for u in sel if u.unit_type == 'villager']
+                            if shift:
+                                # Shift+right-click: append to queue (no limit)
+                                for unit in sel:
+                                    if animal and unit.unit_type == 'villager':
+                                        unit.action_queue.append(
+                                            {'type': 'hunt', 'target': animal})
+                                    elif sheep and unit.unit_type == 'villager':
+                                        unit.action_queue.append(
+                                            {'type': 'slaughter', 'target': sheep})
+                                    elif tile and tile['type'] == 'resource':
+                                        unit.action_queue.append(
+                                            {'type': 'gather', 'target': tile['obj']})
+                                    else:
+                                        unit.action_queue.append(
+                                            {'type': 'move', 'dest': (tx, tz)})
+                                    # If idle, kick off immediately
+                                    if unit.state == 'idle':
+                                        _start_next_action(unit, game, player)
                             else:
-                                move_group(game, sel, tx, tz)
+                                # Normal right-click: replace current task
+                                if animal and vills:
+                                    start_hunt(game, vills, animal)
+                                elif sheep and vills:
+                                    slaughter_sheep(game, player, vills, sheep)
+                                elif tile and tile['type'] == 'resource':
+                                    gather_resource(game, sel, tile['obj'])
+                                else:
+                                    move_group(game, sel, tx, tz)
 
         keys = pygame.key.get_pressed()
         mx, my = pygame.mouse.get_pos()
 
         offset_x += (  CAM_SPEED * keys[K_LEFT]  + edge_speed(mx)
                       - CAM_SPEED * keys[K_RIGHT] - edge_speed(screen_w - 1 - mx))
-        down_dist = max(0, screen_h - BOT_HUD_H - 1 - my)
         offset_y += (  CAM_SPEED * keys[K_UP]    + edge_speed(max(0, my - HUD_H))
-                      - CAM_SPEED * keys[K_DOWN]  - edge_speed(down_dist))
+                      - CAM_SPEED * keys[K_DOWN]  - edge_speed(screen_h - 1 - my))
 
-        game.update_units()
-        update_production(game)
-        update_gathering(game, game.players[0])
-        update_builders(game)
-        update_construction(game)
+        for _ in range(int(GAME_SPEED)):
+            game.update_units()
+            update_production(game, player)
+            update_gathering(game, player)
+            update_hunt(game, player)
+            update_builders(game, player)
+            update_construction(game, player)
+            update_movement(game, player)
+            update_sheep(game, player)
+            cleanup_resources(game)
 
-        elapsed_secs = (pygame.time.get_ticks() - game_start_ticks) // 1000
+        elapsed_secs = int((pygame.time.get_ticks() - game_start_ticks) * GAME_SPEED // 1000)
 
         screen.fill((20, 20, 30))
         draw_plane(screen)
@@ -1108,7 +1703,8 @@ def main():
                  elapsed_secs, hud_font, bold_font)
         sel_count = sum(1 for u in game.units if u.selected)
         draw_bot_hud(screen, selected_building, selected_unit, sel_count,
-                     selected_resource, action_submenu, hud_font, bold_font)
+                     selected_resource, action_submenu, placement_mode,
+                     game.players[0], game, hud_font, bold_font)
         pygame.display.flip()
         clock.tick(FPS)
 

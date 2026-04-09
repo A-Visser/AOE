@@ -23,7 +23,7 @@ def is_passable(game, tx, tz):
     return False
 
 
-def _has_los(game, ax, az, bx, bz):
+def has_los(game, ax, az, bx, bz):
     """Bresenham line-of-sight: True if every tile on the line is passable."""
     dx = abs(bx - ax)
     dz = abs(bz - az)
@@ -44,6 +44,13 @@ def _has_los(game, ax, az, bx, bz):
     return True
 
 
+def can_see(game, ax, az, bx, bz, los_range):
+    """True if (bx, bz) is within los_range tiles of (ax, az) with clear LOS."""
+    if math.hypot(ax - bx, az - bz) > los_range:
+        return False
+    return has_los(game, round(ax), round(az), round(bx), round(bz))
+
+
 def _smooth(game, path):
     """Remove redundant waypoints: keep only those where line-of-sight breaks."""
     if len(path) <= 2:
@@ -54,7 +61,7 @@ def _smooth(game, path):
         # Jump as far ahead as LOS allows
         j = len(path) - 1
         while j > i + 1:
-            if _has_los(game, path[i][0], path[i][1], path[j][0], path[j][1]):
+            if has_los(game, path[i][0], path[i][1], path[j][0], path[j][1]):
                 break
             j -= 1
         out.append(path[j])

@@ -34,16 +34,16 @@ class Game:
         self.players.append(player)
         return player
 
-    def add_building(self, name, tile_x, tile_z, width, depth, color, label=""):
-        b = Building(name, tile_x, tile_z, width, depth, color, label)
+    def add_building(self, name, tile_x, tile_z, width, depth, color, label="", team=None):
+        b = Building(name, tile_x, tile_z, width, depth, color, label, team=team)
         self.buildings.append(b)
         for dx in range(width):
             for dz in range(depth):
                 self.tiles[(tile_x + dx, tile_z + dz)] = {'type': 'building', 'obj': b}
         return b
 
-    def add_unit(self, unit_type, tile_x, tile_z):
-        unit = Unit(unit_type, tile_x, tile_z)
+    def add_unit(self, unit_type, tile_x, tile_z, team=None):
+        unit = Unit(unit_type, tile_x, tile_z, team=team)
         self.units.append(unit)
         return unit
 
@@ -63,10 +63,17 @@ class Game:
                 dist = math.hypot(dx, dz)
                 if 0 < dist < min_dist:
                     push = (min_dist - dist) / dist * 0.5
-                    a.x += dx * push
-                    a.z += dz * push
-                    b.x -= dx * push
-                    b.z -= dz * push
+                    ax_new = a.x + dx * push
+                    az_new = a.z + dz * push
+                    bx_new = b.x - dx * push
+                    bz_new = b.z - dz * push
+                    # Only apply push if it doesn't move unit into a building tile
+                    tile_a = self.tiles.get((round(ax_new), round(az_new)))
+                    tile_b = self.tiles.get((round(bx_new), round(bz_new)))
+                    if not (tile_a and tile_a['type'] == 'building'):
+                        a.x, a.z = ax_new, az_new
+                    if not (tile_b and tile_b['type'] == 'building'):
+                        b.x, b.z = bx_new, bz_new
 
     def start(self):
         self.running = True
@@ -111,7 +118,7 @@ class Game:
                     frontier.append(nb)
         return cluster
 
-    def generate_base(self, grid_size):
+    def generate_base(self, grid_size, team=None):
         """
         Place player starting base in the bottom-left sector.
         TC at center (-26, 26), resources spread in a ring ~20 tiles out.
@@ -122,12 +129,12 @@ class Game:
         # Coordinates are in tiles. With TILE_SIZE=0.5, double all values
         # so world positions match the original layout.
         tc_cx, tc_cz = -52, 52          # logical center of the TC (tile coords)
-        tc_tx = tc_cx - 4               # top-left tile (8×8 tiles = 4×4 world units)
-        tc_tz = tc_cz - 4
-        tc = self.add_building("Town Center", tc_tx, tc_tz, 8, 8,
-                               (0.6, 0.4, 0.1), label="TC")
-        tc.rally_x = tc_tx + 4     # center-front, one tile past the edge
-        tc.rally_z = tc_tz + 9
+        tc_tx = tc_cx - 2               # top-left tile (5×5 tiles)
+        tc_tz = tc_cz - 2
+        tc = self.add_building("Town Center", tc_tx, tc_tz, 5, 5,
+                               (0.6, 0.4, 0.1), label="TC", team=team)
+        tc.rally_x = tc_tx + 2     # center-front, one tile past the edge
+        tc.rally_z = tc_tz + 6
 
         # ── 6 isolated wood tiles in a concentric circle ~6 tiles from TC ─ #
         for i in range(6):
